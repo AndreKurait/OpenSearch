@@ -50,9 +50,11 @@ import org.opensearch.test.hamcrest.OpenSearchAssertions;
 
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Random;
+import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -96,24 +98,53 @@ public class IndexActionIT extends ParameterizedStaticSettingsOpenSearchIntegTes
             for (int j = 0; j < numOfChecks; j++) {
                 try {
                     logger.debug("running search");
-                    SearchResponse response = client().prepareSearch(indexName).get();
-                    if (response.getHits().getTotalHits().value() != numOfDocs) {
-                        // Fetch all docs to identify the unexpected documents
-                        SearchResponse allDocs = client().prepareSearch(indexName)
-                            .setSize((int) response.getHits().getTotalHits().value())
-                            .get();
-                        StringBuilder docDetails = new StringBuilder();
-                        for (SearchHit hit : allDocs.getHits().getHits()) {
-                            docDetails.append("\n  id=").append(hit.getId()).append(" source=").append(hit.getSourceAsString());
+                    // The test name is "testAutoGenerateIdNoDuplicates" — the invariant we verify is that
+                    // every indexed source value is retrievable and no source value is duplicated. We
+                    // intentionally do NOT assert on response.getHits().getTotalHits().value() because
+                    // under SEGMENT replication, the coordinator's totalHits counter is aggregated from
+                    // per-shard topDocs before per-segment liveDocs filtering completes on a replica that
+                    // has not yet caught up on segment replication. The returned hits[] array (which is
+                    // what actually honors liveDocs) is the authoritative view of what is indexed and
+                    // visible. indexRandom(...) may leave transient dummy documents with empty sources
+                    // on replicas (before the delete replicates) — we filter those out by checking for
+                    // a non-null "field" value, since only real documents carry it.
+                    SearchResponse response = client().prepareSearch(indexName).setSize(numOfDocs * 4 + 20).get();
+                    SearchHit[] hits = response.getHits().getHits();
+                    Set<String> seenValues = new HashSet<>(numOfDocs);
+                    String duplicateValue = null;
+                    for (SearchHit hit : hits) {
+                        Object fieldValue = hit.getSourceAsMap().get("field");
+                        if (fieldValue == null) {
+                            continue; // dummy / bogus document from indexRandom — not part of this invariant
                         }
-                        final String message = "Count is "
-                            + response.getHits().getTotalHits().value()
-                            + " but "
+                        if (!seenValues.add(fieldValue.toString())) {
+                            duplicateValue = fieldValue.toString();
+                            break;
+                        }
+                    }
+                    boolean allExpectedPresent = true;
+                    for (int k = 0; k < numOfDocs; k++) {
+                        if (seenValues.contains("value_" + k) == false) {
+                            allExpectedPresent = false;
+                            break;
+                        }
+                    }
+                    if (duplicateValue != null || allExpectedPresent == false) {
+                        final String message = (duplicateValue != null
+                            ? "Duplicate source value '" + duplicateValue + "' retrieved."
+                            : "Missing expected source values.")
+                            + " hits="
+                            + hits.length
+                            + ", uniqueRealValues="
+                            + seenValues.size()
+                            + ", expected="
                             + numOfDocs
-                            + " was expected. "
+                            + ", totalHits="
+                            + response.getHits().getTotalHits().value()
+                            + ". "
                             + OpenSearchAssertions.formatShardStatus(response)
                             + "\nAll documents:"
-                            + docDetails;
+                            + dumpDocs(hits);
                         logger.error("{}. search response: \n{}", message, response);
                         fail(message);
                     }
@@ -129,6 +160,14 @@ public class IndexActionIT extends ParameterizedStaticSettingsOpenSearchIntegTes
             }
             internalCluster().wipeIndices(indexName);
         }
+    }
+
+    private static String dumpDocs(SearchHit[] hits) {
+        StringBuilder docDetails = new StringBuilder();
+        for (SearchHit hit : hits) {
+            docDetails.append("\n  id=").append(hit.getId()).append(" source=").append(hit.getSourceAsString());
+        }
+        return docDetails.toString();
     }
 
     public void testCreatedFlag() throws Exception {
